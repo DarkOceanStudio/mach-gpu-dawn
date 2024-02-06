@@ -6,7 +6,6 @@ pub fn build(b: *std.Build) !void {
 
     const options = Options{
         .install_libs = true,
-        .from_source = false,
     };
     // Just to demonstrate/test linking. This is not a functional example, see the mach/gpu examples
     // or Dawn C++ examples for functional example code.
@@ -21,35 +20,6 @@ pub fn build(b: *std.Build) !void {
     const example_step = b.step("dawn", "Build dawn from source");
     example_step.dependOn(&b.addRunArtifact(example).step);
 }
-
-pub const DownloadBinaryStep = struct {
-    target: *std.Build.Step.Compile,
-    options: Options,
-    step: std.Build.Step,
-    b: *std.Build,
-
-    pub fn init(b: *std.Build, target: *std.Build.Step.Compile, options: Options) *DownloadBinaryStep {
-        const download_step = b.allocator.create(DownloadBinaryStep) catch unreachable;
-        download_step.* = .{
-            .target = target,
-            .options = options,
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = "download",
-                .owner = b,
-                .makeFn = &make,
-            }),
-            .b = b,
-        };
-        return download_step;
-    }
-
-    fn make(step: *std.Build.Step, prog_node: *std.Progress.Node) anyerror!void {
-        _ = prog_node;
-        const download_step = @fieldParentPtr(DownloadBinaryStep, "step", step);
-        try downloadFromBinary(download_step.b, download_step.target, download_step.options);
-    }
-};
 
 pub const Options = struct {
     /// Defaults to true on Windows
@@ -81,14 +51,11 @@ pub const Options = struct {
     /// Whether or not to produce shared libraries instead of static ones
     shared_libs: bool = false,
 
-    /// Whether to build Dawn from source or not.
-    from_source: bool = false,
-
     /// Produce static libraries at zig-out/lib
     install_libs: bool = false,
 
     /// The binary release version to use from https://github.com/hexops/mach-gpu-dawn/releases
-            binary_version: []const u8 = "release-1cce80c",
+    binary_version: []const u8 = "release-1cce80c",
 
     /// Detects the default options to use for the given target.
     pub fn detectDefaults(self: Options, target: std.Target) Options {
@@ -117,18 +84,7 @@ pub fn link(b: *std.Build, step: *std.Build.Step.Compile, mod: *std.Build.Module
     if (target.os.tag == .windows) @import("direct3d_headers").addLibraryPath(step);
     if (target.os.tag == .macos) @import("xcode_frameworks").addPaths(mod);
 
-    if (options.from_source or isEnvVarTruthy(b.allocator, "DAWN_FROM_SOURCE")) {
-        linkFromSource(b, step, mod, opt) catch unreachable;
-    } else {
-        // Add a build step to download Dawn binaries. This ensures it only downloads if needed,
-        // and that e.g. if you are running a different `zig build <step>` it doesn't always just
-        // download the binaries.
-        var download_step = DownloadBinaryStep.init(b, step, options);
-        step.step.dependOn(&download_step.step);
-
-        // Declare how to link against the binaries.
-        linkFromBinary(b, step, mod, opt) catch unreachable;
-    }
+    linkFromSource(b, step, mod, opt) catch unreachable;
 }
 
 fn linkFromSource(b: *std.Build, step: *std.Build.Step.Compile, mod: *std.Build.Module, options: Options) !void {
@@ -171,11 +127,11 @@ fn linkFromSource(b: *std.Build, step: *std.Build.Step.Compile, mod: *std.Build.
     const lib_dawn = if (options.shared_libs) b.addSharedLibrary(.{
         .name = "dawn",
         .target = step.root_module.resolved_target.?,
-        .optimize = if (options.debug) .Debug else .ReleaseFast,
+        .optimize = step.root_module.optimize.?,
     }) else b.addStaticLibrary(.{
         .name = "dawn",
         .target = step.root_module.resolved_target.?,
-        .optimize = if (options.debug) .Debug else .ReleaseFast,
+        .optimize = step.root_module.optimize.?,
     });
     step.linkLibrary(lib_dawn);
 
@@ -270,118 +226,11 @@ fn getGitHubBaseURLOwned(allocator: std.mem.Allocator) ![]const u8 {
     }
 }
 
-var download_mutex = std.Thread.Mutex{};
-
-pub fn downloadFromBinary(b: *std.Build, step: *std.Build.Step.Compile, options: Options) !void {
-    // Zig will run build steps in parallel if possible, so if there were two invocations of
-    // link() then this function would be called in parallel. We're manipulating the FS here
-    // and so need to prevent that.
-    download_mutex.lock();
-    defer download_mutex.unlock();
-
-    const target = step.rootModuleTarget();
-    const binaries_available = switch (target.os.tag) {
-        .windows => target.abi.isGnu(),
-        .linux => (target.cpu.arch.isX86() or target.cpu.arch.isAARCH64()) and (target.abi.isGnu() or target.abi.isMusl()),
-        .macos => blk: {
-            if (!target.cpu.arch.isX86() and !target.cpu.arch.isAARCH64()) break :blk false;
-
-            // The minimum macOS version with which our binaries can be used.
-            const min_available = std.SemanticVersion{ .major = 11, .minor = 0, .patch = 0 };
-
-            // If the target version is >= the available version, then it's OK.
-            const order = target.os.version_range.semver.min.order(min_available);
-            break :blk (order == .gt or order == .eq);
-        },
-        else => false,
-    };
-    if (!binaries_available) {
-        const zig_triple = try target.zigTriple(b.allocator);
-        std.log.err("gpu-dawn binaries for {s} not available.", .{zig_triple});
-        std.log.err("-> open an issue: https://github.com/hexops/mach/issues", .{});
-        std.log.err("-> build from source (takes 5-15 minutes):", .{});
-        std.log.err("    set `DAWN_FROM_SOURCE` environment variable or `Options.from_source` to `true`\n", .{});
-        if (target.os.tag == .macos) {
-            std.log.err("", .{});
-            if (target.cpu.arch.isX86()) std.log.err("-> Did you mean to use -Dtarget=x86_64-macos.12.0...13.1-none ?", .{});
-            if (target.cpu.arch.isAARCH64()) std.log.err("-> Did you mean to use -Dtarget=aarch64-macos.12.0...13.1-none ?", .{});
-        }
-        std.process.exit(1);
-    }
-
-    // Remove OS version range / glibc version from triple (we do not include that in our download
-    // URLs.)
-    var binary_target = std.zig.CrossTarget.fromTarget(target);
-    binary_target.os_version_min = .{ .none = undefined };
-    binary_target.os_version_max = .{ .none = undefined };
-    binary_target.glibc_version = null;
-    const zig_triple = try binary_target.zigTriple(b.allocator);
-    try ensureBinaryDownloaded(
-        b.allocator,
-        b.cache_root.path,
-        zig_triple,
-        options.debug,
-        target.os.tag == .windows,
-        options.binary_version,
-    );
-}
-
-pub fn linkFromBinary(b: *std.Build, step: *std.Build.Step.Compile, mod: *std.Build.Module, options: Options) !void {
-    const target = step.rootModuleTarget();
-
-    // Remove OS version range / glibc version from triple (we do not include that in our download
-    // URLs.)
-    var binary_target = std.zig.CrossTarget.fromTarget(target);
-    binary_target.os_version_min = .{ .none = undefined };
-    binary_target.os_version_max = .{ .none = undefined };
-    binary_target.glibc_version = null;
-    const zig_triple = try binary_target.zigTriple(b.allocator);
-
-    const base_cache_dir_rel = try std.fs.path.join(b.allocator, &.{
-        b.cache_root.path orelse "zig-cache",
-        "mach",
-        "gpu-dawn",
-    });
-    try std.fs.cwd().makePath(base_cache_dir_rel);
-    const base_cache_dir = try std.fs.cwd().realpathAlloc(b.allocator, base_cache_dir_rel);
-    const commit_cache_dir = try std.fs.path.join(b.allocator, &.{ base_cache_dir, options.binary_version });
-    const release_tag = if (options.debug) "debug" else "release-fast";
-    const target_cache_dir = try std.fs.path.join(b.allocator, &.{ commit_cache_dir, zig_triple, release_tag });
-    const include_dir = try std.fs.path.join(b.allocator, &.{ commit_cache_dir, "include" });
-
-    step.addLibraryPath(.{ .path = target_cache_dir });
-    step.linkSystemLibrary("dawn");
-    step.linkLibCpp();
-
-    step.addIncludePath(.{ .path = include_dir });
-    step.addIncludePath(.{ .path = sdkPath("/src/dawn") });
-
-    linkLibDawnCommonDependencies(b, step, mod, options);
-    linkLibDawnPlatformDependencies(b, step, mod, options);
-    linkLibDawnNativeDependencies(b, step, mod, options);
-    linkLibTintDependencies(b, step, mod, options);
-    linkLibSPIRVToolsDependencies(b, step, mod, options);
-    linkLibAbseilCppDependencies(b, step, mod, options);
-    linkLibDawnWireDependencies(b, step, mod, options);
-    linkLibDxcompilerDependencies(b, step, mod, options);
-
-    // Transitive dependencies, explicit linkage of these works around
-    // ziglang/zig#17130
-    if (target.os.tag == .macos) {
-        step.linkFramework("CoreImage");
-        step.linkFramework("CoreVideo");
-    }
-}
-
 pub fn addPathsToModule(b: *std.Build, module: *std.Build.Module, options: Options) void {
     const target = (module.resolved_target orelse b.host).result;
     const opt = options.detectDefaults(target);
 
-    if (options.from_source or isEnvVarTruthy(b.allocator, "DAWN_FROM_SOURCE")) {
-        addPathsToModuleFromSource(b, module, opt) catch unreachable;
-    } else {
-        addPathsToModuleFromBinary(b, module, opt) catch unreachable;
-    }
+    addPathsToModuleFromSource(b, module, opt) catch unreachable;
 }
 
 pub fn addPathsToModuleFromSource(b: *std.Build, module: *std.Build.Module, options: Options) !void {
@@ -391,206 +240,6 @@ pub fn addPathsToModuleFromSource(b: *std.Build, module: *std.Build.Module, opti
     module.addIncludePath(.{ .path = sdkPath("/libs/dawn/out/Debug/gen/include") });
     module.addIncludePath(.{ .path = sdkPath("/libs/dawn/include") });
     module.addIncludePath(.{ .path = sdkPath("/src/dawn") });
-}
-
-pub fn addPathsToModuleFromBinary(b: *std.Build, module: *std.Build.Module, options: Options) !void {
-    const target = (module.resolved_target orelse b.host).result;
-
-    // Remove OS version range / glibc version from triple (we do not include that in our download
-    // URLs.)
-    var binary_target = std.zig.CrossTarget.fromTarget(target);
-    binary_target.os_version_min = .{ .none = undefined };
-    binary_target.os_version_max = .{ .none = undefined };
-    binary_target.glibc_version = null;
-    const zig_triple = try binary_target.zigTriple(b.allocator);
-
-    const base_cache_dir_rel = try std.fs.path.join(b.allocator, &.{
-        b.cache_root.path orelse "zig-cache",
-        "mach",
-        "gpu-dawn",
-    });
-    try std.fs.cwd().makePath(base_cache_dir_rel);
-    const base_cache_dir = try std.fs.cwd().realpathAlloc(b.allocator, base_cache_dir_rel);
-    const commit_cache_dir = try std.fs.path.join(b.allocator, &.{ base_cache_dir, options.binary_version });
-    const release_tag = if (options.debug) "debug" else "release-fast";
-    const target_cache_dir = try std.fs.path.join(b.allocator, &.{ commit_cache_dir, zig_triple, release_tag });
-    _ = target_cache_dir;
-    const include_dir = try std.fs.path.join(b.allocator, &.{ commit_cache_dir, "include" });
-
-    module.addIncludePath(.{ .path = include_dir });
-    module.addIncludePath(.{ .path = sdkPath("/src/dawn") });
-}
-
-pub fn ensureBinaryDownloaded(
-    allocator: std.mem.Allocator,
-    cache_root: ?[]const u8,
-    zig_triple: []const u8,
-    is_debug: bool,
-    is_windows: bool,
-    version: []const u8,
-) !void {
-    // If zig-cache/mach/gpu-dawn/<git revision> does not exist:
-    //   If on a commit in the main branch => rm -r zig-cache/mach/gpu-dawn/
-    //   else => noop
-    // If zig-cache/mach/gpu-dawn/<git revision>/<target> exists:
-    //   noop
-    // else:
-    //   Download archive to zig-cache/mach/gpu-dawn/download/macos-aarch64
-    //   Extract to zig-cache/mach/gpu-dawn/<git revision>/macos-aarch64/libgpu.a
-    //   Remove zig-cache/mach/gpu-dawn/download
-
-    const base_cache_dir_rel = try std.fs.path.join(allocator, &.{ cache_root orelse "zig-cache", "mach", "gpu-dawn" });
-    try std.fs.cwd().makePath(base_cache_dir_rel);
-    const base_cache_dir = try std.fs.cwd().realpathAlloc(allocator, base_cache_dir_rel);
-    const commit_cache_dir = try std.fs.path.join(allocator, &.{ base_cache_dir, version });
-    defer {
-        allocator.free(base_cache_dir_rel);
-        allocator.free(base_cache_dir);
-        allocator.free(commit_cache_dir);
-    }
-
-    if (!dirExists(commit_cache_dir)) {
-        // Commit cache dir does not exist. If the commit we're on is in the main branch, we're
-        // probably moving to a newer commit and so we should cleanup older cached binaries.
-        const current_git_commit = try getCurrentGitCommit(allocator);
-        if (gitBranchContainsCommit(allocator, "main", current_git_commit) catch false) {
-            std.fs.deleteTreeAbsolute(base_cache_dir) catch {};
-        }
-    }
-
-    const release_tag = if (is_debug) "debug" else "release-fast";
-    const target_cache_dir = try std.fs.path.join(allocator, &.{ commit_cache_dir, zig_triple, release_tag });
-    defer allocator.free(target_cache_dir);
-    if (dirExists(target_cache_dir)) {
-        return; // nothing to do, already have the binary
-    }
-    downloadBinary(allocator, commit_cache_dir, release_tag, target_cache_dir, zig_triple, is_windows, version) catch |err| {
-        // A download failed, or extraction failed, so wipe out the directory to ensure we correctly
-        // try again next time.
-        std.fs.deleteTreeAbsolute(base_cache_dir) catch {};
-        std.log.err("mach/gpu-dawn: prebuilt binary download failed: {s}", .{@errorName(err)});
-        std.process.exit(1);
-    };
-}
-
-fn downloadBinary(
-    allocator: std.mem.Allocator,
-    commit_cache_dir: []const u8,
-    release_tag: []const u8,
-    target_cache_dir: []const u8,
-    zig_triple: []const u8,
-    is_windows: bool,
-    version: []const u8,
-) !void {
-    const download_dir = try std.fs.path.join(allocator, &.{ target_cache_dir, "download" });
-    defer allocator.free(download_dir);
-    std.fs.cwd().makePath(download_dir) catch @panic(download_dir);
-    std.debug.print("download_dir: {s}\n", .{download_dir});
-
-    // Replace "..." with "---" because GitHub releases has very weird restrictions on file names.
-    // https://twitter.com/slimsag/status/1498025997987315713
-    const github_triple = try std.mem.replaceOwned(u8, allocator, zig_triple, "...", "---");
-    defer allocator.free(github_triple);
-
-    // Compose the download URL, e.g.:
-    // https://github.com/hexops/mach-gpu-dawn/releases/download/release-6b59025/libdawn_x86_64-macos-none_debug.a.gz
-    const github_base_url = try getGitHubBaseURLOwned(allocator);
-    defer allocator.free(github_base_url);
-    const lib_prefix = if (is_windows) "dawn_" else "libdawn_";
-    const lib_ext = if (is_windows) ".lib" else ".a";
-    const lib_file_name = if (is_windows) "dawn.lib" else "libdawn.a";
-    const download_url = try std.mem.concat(allocator, u8, &.{
-        github_base_url,
-        "/hexops/mach-gpu-dawn/releases/download/",
-        version,
-        "/",
-        lib_prefix,
-        github_triple,
-        "_",
-        release_tag,
-        lib_ext,
-        ".gz",
-    });
-    defer allocator.free(download_url);
-
-    // Download and decompress libdawn
-    const gz_target_file = try std.fs.path.join(allocator, &.{ download_dir, "compressed.gz" });
-    defer allocator.free(gz_target_file);
-    downloadFile(allocator, gz_target_file, download_url) catch @panic(gz_target_file);
-    const target_file = try std.fs.path.join(allocator, &.{ target_cache_dir, lib_file_name });
-    defer allocator.free(target_file);
-    try gzipDecompress(allocator, gz_target_file, target_file);
-
-    // If we don't yet have the headers (these are shared across architectures), download them.
-    const include_dir = try std.fs.path.join(allocator, &.{ commit_cache_dir, "include" });
-    defer allocator.free(include_dir);
-    if (!dirExists(include_dir)) {
-        // Compose the headers download URL, e.g.:
-        // https://github.com/hexops/mach-gpu-dawn/releases/download/release-6b59025/headers.json.gz
-        const headers_download_url = try std.mem.concat(allocator, u8, &.{
-            github_base_url,
-            "/hexops/mach-gpu-dawn/releases/download/",
-            version,
-            "/headers.json.gz",
-        });
-        defer allocator.free(headers_download_url);
-
-        // Download and decompress headers.json.gz
-        const headers_gz_target_file = try std.fs.path.join(allocator, &.{ download_dir, "headers.json.gz" });
-        defer allocator.free(headers_gz_target_file);
-        downloadFile(allocator, headers_gz_target_file, headers_download_url) catch @panic(headers_gz_target_file);
-        const headers_target_file = try std.fs.path.join(allocator, &.{ target_cache_dir, "headers.json" });
-        defer allocator.free(headers_target_file);
-        gzipDecompress(allocator, headers_gz_target_file, headers_target_file) catch @panic(headers_target_file);
-
-        // Extract headers JSON archive.
-        extractHeaders(allocator, headers_target_file, commit_cache_dir) catch @panic(commit_cache_dir);
-    }
-
-    try std.fs.deleteTreeAbsolute(download_dir);
-}
-
-fn extractHeaders(allocator: std.mem.Allocator, json_file: []const u8, out_dir: []const u8) !void {
-    const contents = try std.fs.cwd().readFileAlloc(allocator, json_file, std.math.maxInt(usize));
-    defer allocator.free(contents);
-
-    var tree = try std.json.parseFromSlice(std.json.Value, allocator, contents, .{});
-    defer tree.deinit();
-
-    var iter = tree.value.object.iterator();
-    while (iter.next()) |f| {
-        const out_path = try std.fs.path.join(allocator, &.{ out_dir, f.key_ptr.* });
-        defer allocator.free(out_path);
-        try std.fs.cwd().makePath(std.fs.path.dirname(out_path).?);
-
-        var new_file = try std.fs.createFileAbsolute(out_path, .{});
-        defer new_file.close();
-        try new_file.writeAll(f.value_ptr.*.string);
-    }
-}
-
-fn dirExists(path: []const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
-    dir.close();
-    return true;
-}
-
-fn gzipDecompress(allocator: std.mem.Allocator, src_absolute_path: []const u8, dst_absolute_path: []const u8) !void {
-    var file = try std.fs.openFileAbsolute(src_absolute_path, .{ .mode = .read_only });
-    defer file.close();
-
-    var buf_stream = std.io.bufferedReader(file.reader());
-    var gzip_stream = try std.compress.gzip.decompress(allocator, buf_stream.reader());
-    defer gzip_stream.deinit();
-
-    // Read and decompress the whole file
-    const buf = try gzip_stream.reader().readAllAlloc(allocator, std.math.maxInt(usize));
-    defer allocator.free(buf);
-
-    var new_file = try std.fs.createFileAbsolute(dst_absolute_path, .{});
-    defer new_file.close();
-
-    try new_file.writeAll(buf);
 }
 
 fn gitBranchContainsCommit(allocator: std.mem.Allocator, branch: []const u8, commit: []const u8) !bool {
@@ -628,20 +277,6 @@ fn gitClone(allocator: std.mem.Allocator, repository: []const u8, dir: []const u
         allocator.free(result.stderr);
     }
     return result.term.Exited == 0;
-}
-
-fn downloadFile(allocator: std.mem.Allocator, target_file_path: []const u8, url: []const u8) !void {
-    std.debug.print("downloading {s}..\n", .{url});
-
-    const target_file = try std.fs.cwd().createFile(target_file_path, .{});
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-    var fetch_res = try client.fetch(allocator, .{
-        .location = .{ .url = url },
-        .response_strategy = .{ .file = target_file },
-    });
-    fetch_res.deinit();
 }
 
 fn isLinuxDesktopLike(tag: std.Target.Os.Tag) bool {
